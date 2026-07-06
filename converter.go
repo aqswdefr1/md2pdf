@@ -1,35 +1,26 @@
 package main
 
 import (
+	"context"
 	"fmt"
-	"image/color"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
+	"time"
 
-	"github.com/signintech/gopdf"
+	"github.com/chromedp/cdproto/page"
+	"github.com/chromedp/chromedp"
 	"github.com/yuin/goldmark"
-	"github.com/yuin/goldmark/ast"
-	"github.com/yuin/goldmark/text"
+	"github.com/yuin/goldmark/extension"
+	"github.com/yuin/goldmark/parser"
+	"github.com/yuin/goldmark/renderer/html"
 )
 
-type TextSpan struct {
-	Text     string
-	Font     string // regular, bold, italic, code
-	Size     float64
-	Color    color.RGBA
-	BgColor  *color.RGBA
-	IsLink   bool
-	LinkDest string
-}
-
 type PDFConverter struct {
-	pdf       gopdf.GoPdf
-	theme     Theme
-	margin    float64
-	y         float64
-	pageWidth float64
-	pageHeight float64
-	source    []byte
+	theme  Theme
+	margin float64
+	source []byte
 }
 
 func NewPDFConverter(theme Theme, margin float64, source []byte) *PDFConverter {
@@ -41,63 +32,108 @@ func NewPDFConverter(theme Theme, margin float64, source []byte) *PDFConverter {
 }
 
 func (c *PDFConverter) Convert(markdownPath string, pdfPath string, isLandscape bool) error {
-	// PDF Başlat
-	c.pdf.Start(gopdf.Config{
-		PageSize: *gopdf.PageSizeA4,
-	})
-
-	if isLandscape {
-		// Dikey yerine yatay yap
-		// Gopdf A4 varsayılanı 595.27 x 841.89 (dikey)
-		// Yatay için boyutları değiştirebiliriz.
-		// Ancak gopdf.Config içinde PageSize zaten bir struct'tır.
-		// Dikey/Yatay modunu sayfa eklerken de belirtebiliriz veya Config'de ayarlayabiliriz.
-		// Burası şimdilik dikey A4 olarak kalabilir, çünkü varsayılan A4 en yaygın olanıdır.
+	// 1. Markdown'ı HTML'e dönüştür
+	md := goldmark.New(
+		goldmark.WithExtensions(
+			extension.GFM, // GitHub Flavored Markdown (tablolar, autolink vb.)
+			extension.Footnote,
+		),
+		goldmark.WithParserOptions(
+			parser.WithAutoHeadingID(),
+		),
+		goldmark.WithRendererOptions(
+			html.WithUnsafe(),
+		),
+	)
+	var htmlBuf strings.Builder
+	if err := md.Convert(c.source, &htmlBuf); err != nil {
+		return fmt.Errorf("markdown html'e dönüştürülemedi: %v", err)
 	}
 
-	c.pageWidth = 595.27
-	c.pageHeight = 841.89
+	htmlContent := htmlBuf.String()
 
-	// Fontları yükle
-	err := c.pdf.AddTTFFont("regular", "assets/fonts/DejaVuSans.ttf")
+	// 2. Alert kutularını HTML içinde düzenle
+	htmlContent = convertAlertsToHTML(htmlContent)
+
+	// 3. Kapak sayfasını ayrıştır
+	coverHTML, remainingHTML := extractCoverPage(htmlContent)
+
+	// 4. CSS ve Şablon ekle
+	marginMm := fmt.Sprintf("%dmm", int(c.margin * 0.352778)) // point'ten mm'ye dönüşüm
+	if c.margin == 50.0 {
+		marginMm = "20mm" // Varsayılan değer
+	}
+	
+	themeCSS := getThemeCSS(c.theme.Name, marginMm, isLandscape)
+	
+	fullHTML := fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head>
+	<meta charset="utf-8">
+	<style>
+		%s
+	</style>
+</head>
+<body>
+	<div class="markdown-body">
+		%s
+		<div class="content-page">
+			%s
+		</div>
+	</div>
+</body>
+</html>`, themeCSS, coverHTML, remainingHTML)
+
+	// 4. Geçici bir HTML dosyası yaz
+	tempHTMLPath := pdfPath + ".temp.html"
+	err := os.WriteFile(tempHTMLPath, []byte(fullHTML), 0644)
 	if err != nil {
-		return fmt.Errorf("regular font yüklenemedi: %v", err)
+		return fmt.Errorf("geçici html yazılamadı: %v", err)
 	}
-	err = c.pdf.AddTTFFont("bold", "assets/fonts/DejaVuSans-Bold.ttf")
+	defer os.Remove(tempHTMLPath)
+
+	// 5. Chromedp ile headless tarayıcıyı başlat ve PDF yazdır
+	ctx, cancel := chromedp.NewContext(context.Background())
+	defer cancel()
+
+	// 30 saniye timeout
+	ctx, cancelTimeout := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelTimeout()
+
+	// Mutlak yol bul
+	absHTMLPath, err := filepath.Abs(tempHTMLPath)
 	if err != nil {
-		return fmt.Errorf("bold font yüklenemedi: %v", err)
+		return fmt.Errorf("dosya yolu çözülemedi: %v", err)
 	}
-	err = c.pdf.AddTTFFont("italic", "assets/fonts/DejaVuSans-Oblique.ttf")
+	url := "file:///" + filepath.ToSlash(absHTMLPath)
+
+	var pdfBuffer []byte
+	err = chromedp.Run(ctx,
+		chromedp.Navigate(url),
+		chromedp.WaitReady("body"),
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			buf, _, err := page.PrintToPDF().
+				WithMarginTop(0).
+				WithMarginBottom(0).
+				WithMarginLeft(0).
+				WithMarginRight(0).
+				WithLandscape(isLandscape).
+				WithPrintBackground(true).
+				WithPreferCSSPageSize(true).
+				Do(ctx)
+			if err != nil {
+				return err
+			}
+			pdfBuffer = buf
+			return nil
+		}),
+	)
 	if err != nil {
-		return fmt.Errorf("italic font yüklenemedi: %v", err)
-	}
-	err = c.pdf.AddTTFFont("code", "assets/fonts/DejaVuSansMono.ttf")
-	if err != nil {
-		return fmt.Errorf("code font yüklenemedi: %v", err)
+		return fmt.Errorf("chrome pdf yazdıramadı: %v", err)
 	}
 
-	c.pdf.AddPage()
-	c.y = c.margin
-
-	// Arka plan rengini ayarla (varsayılan beyaz ise çizmeye gerek yok ama diğer renkler için)
-	c.drawBackground()
-
-	// Goldmark ile parser oluştur
-	md := goldmark.New()
-	reader := text.NewReader(c.source)
-	doc := md.Parser().Parse(reader)
-
-	// AST'yi dolaş
-	err = c.renderNode(doc)
-	if err != nil {
-		return err
-	}
-
-	// Sayfa numaralarını ekle
-	c.addPageNumbers()
-
-	// Dosyayı kaydet
-	err = c.pdf.WritePdf(pdfPath)
+	// 6. PDF dosyasını diske kaydet
+	err = os.WriteFile(pdfPath, pdfBuffer, 0644)
 	if err != nil {
 		return fmt.Errorf("pdf kaydedilemedi: %v", err)
 	}
@@ -105,456 +141,304 @@ func (c *PDFConverter) Convert(markdownPath string, pdfPath string, isLandscape 
 	return nil
 }
 
-func (c *PDFConverter) drawBackground() {
-	if c.theme.BgColor.R != 255 || c.theme.BgColor.G != 255 || c.theme.BgColor.B != 255 {
-		c.pdf.SetFillColor(c.theme.BgColor.R, c.theme.BgColor.G, c.theme.BgColor.B)
-		c.pdf.RectFromUpperLeftWithStyle(0, 0, c.pageWidth, c.pageHeight, "F")
-	}
-}
-
-func (c *PDFConverter) renderNode(node ast.Node) error {
-	for child := node.FirstChild(); child != nil; child = child.NextSibling() {
-		switch child.Kind() {
-		case ast.KindHeading:
-			c.renderHeading(child.(*ast.Heading))
-		case ast.KindParagraph:
-			c.renderParagraph(child.(*ast.Paragraph))
-		case ast.KindBlockquote:
-			c.renderBlockquote(child.(*ast.Blockquote))
-		case ast.KindList:
-			c.renderList(child.(*ast.List), 0)
-		case ast.KindFencedCodeBlock:
-			c.renderFencedCodeBlock(child.(*ast.FencedCodeBlock))
-		case ast.KindThematicBreak:
-			c.renderThematicBreak(child.(*ast.ThematicBreak))
-		default:
-			// Desteklenmeyen veya konteyner olan diğer blokları recursive işle
-			if child.HasChildren() {
-				c.renderNode(child)
-			}
-		}
-		c.y += 12 // Bloklar arası boşluk
-	}
-	return nil
-}
-
-func (c *PDFConverter) checkPageBreak(neededHeight float64) {
-	if c.y+neededHeight > c.pageHeight-c.margin {
-		c.pdf.AddPage()
-		c.drawBackground()
-		c.y = c.margin
-	}
-}
-
-func (c *PDFConverter) renderHeading(h *ast.Heading) {
-	var fontStyle FontStyle
-	switch h.Level {
-	case 1:
-		fontStyle = c.theme.H1
-	case 2:
-		fontStyle = c.theme.H2
-	case 3:
-		fontStyle = c.theme.H3
-	default:
-		fontStyle = c.theme.H4
-	}
-
-	c.checkPageBreak(fontStyle.Size * 2)
-
-	// Altında çizgi olan H1 ve H2'ler için ekstra boşluk ve çizgi
-	spans := c.collectInlineSpans(h, "bold", fontStyle.Size, fontStyle.Color)
-	c.renderSpans(spans, c.margin, 1.3)
-
-	if h.Level <= 2 {
-		c.y += 4
-		c.pdf.SetLineWidth(0.8)
-		c.pdf.SetStrokeColor(c.theme.BorderColor.R, c.theme.BorderColor.G, c.theme.BorderColor.B)
-		c.pdf.Line(c.margin, c.y, c.pageWidth-c.margin, c.y)
-		c.y += 6
-	}
-}
-
-func (c *PDFConverter) renderParagraph(p *ast.Paragraph) {
-	spans := c.collectInlineSpans(p, "regular", c.theme.Body.Size, c.theme.Body.Color)
-	c.renderSpans(spans, c.margin, 1.4)
-}
-
-func (c *PDFConverter) renderBlockquote(b *ast.Blockquote) {
-	// Blockquote'un içindeki çocukları topluca render et ama sol tarafa çizgi çek ve girinti ver
-	// Giriş koordinatlarını sakla
-	oldMargin := c.margin
-	c.margin = oldMargin + 15 // İçeri kaydır
-
-	// Blockquote solundaki dikey çizgi için koordinat hesapla
-	startY := c.y
-
-	// İçeriği render et
-	c.renderNode(b)
-
-	endY := c.y
-
-	// Çizgiyi çiz
-	c.pdf.SetLineWidth(3.0)
-	c.pdf.SetStrokeColor(c.theme.BlockquoteColor.R, c.theme.BlockquoteColor.G, c.theme.BlockquoteColor.B)
-	c.pdf.Line(oldMargin+5, startY, oldMargin+5, endY)
-
-	// Margin'i geri al
-	c.margin = oldMargin
-}
-
-func (c *PDFConverter) renderList(l *ast.List, depth int) {
-	oldMargin := c.margin
-	c.margin = oldMargin + float64(depth)*15
-
-	index := 1
-	for child := l.FirstChild(); child != nil; child = child.NextSibling() {
-		if child.Kind() == ast.KindListItem {
-			c.renderListItem(child.(*ast.ListItem), l.IsOrdered(), index, depth)
-			index++
-		}
-	}
-
-	c.margin = oldMargin
-}
-
-func (c *PDFConverter) renderListItem(li *ast.ListItem, isOrdered bool, index int, depth int) {
-	c.checkPageBreak(c.theme.Body.Size * 1.5)
-
-	bulletStr := "• "
-	if isOrdered {
-		bulletStr = fmt.Sprintf("%d. ", index)
-	}
-
-	// Bullet çiz
-	c.pdf.SetFont("regular", "", c.theme.Body.Size)
-	c.pdf.SetTextColor(c.theme.TextColor.R, c.theme.TextColor.G, c.theme.TextColor.B)
-	c.pdf.SetXY(c.margin+10, c.y)
-	c.pdf.Text(bulletStr)
-
-	// List item içeriğini çek
-	// List item genellikle paragraf barındırabilir
-	oldMargin := c.margin
-	c.margin = oldMargin + 22 // İçeriği bullet'ın sağından başlat
-
-	// Çocukları render et
-	for child := li.FirstChild(); child != nil; child = child.NextSibling() {
-		if child.Kind() == ast.KindParagraph {
-			spans := c.collectInlineSpans(child, "regular", c.theme.Body.Size, c.theme.Body.Color)
-			c.renderSpans(spans, c.margin, 1.4)
-		} else if child.Kind() == ast.KindList {
-			c.renderList(child.(*ast.List), depth+1)
-		} else {
-			c.renderNode(li)
-		}
-	}
-
-	c.margin = oldMargin
-}
-
-func (c *PDFConverter) renderFencedCodeBlock(cb *ast.FencedCodeBlock) {
-	// Kod bloğu metnini oku
-	var codeLines []string
-	lines := cb.Lines()
-	for i := 0; i < lines.Len(); i++ {
-		line := lines.At(i)
-		codeLines = append(codeLines, string(line.Value(c.source)))
-	}
-	codeText := strings.Join(codeLines, "")
-
-	// Satırları böl
-	splitLines := strings.Split(codeText, "\n")
-	if len(splitLines) > 0 && splitLines[len(splitLines)-1] == "" {
-		splitLines = splitLines[:len(splitLines)-1]
-	}
-
-	// Blok yüksekliğini hesapla
-	lineHeight := c.theme.Code.Size * 1.4
-	blockHeight := float64(len(splitLines))*lineHeight + 16
-
-	c.checkPageBreak(30) // En az 3 satırlık yer yoksa yeni sayfaya geç
-
-	// Eğer tüm kod bloğu sayfaya sığmıyorsa, sayfa sayfa böleceğiz
-	startY := c.y
-	c.pdf.SetFillColor(c.theme.CodeBg.R, c.theme.CodeBg.G, c.theme.CodeBg.B)
+func convertAlertsToHTML(html string) string {
+	re := regexp.MustCompile(`(?is)<blockquote>\s*<p>\s*\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*(.*?)</p>\s*(.*?)</blockquote>`)
 	
-	// Arka plan kutusunu çiz (sayfa sonuna kadar olan kısmı veya bloğun tamamını)
-	drawHeight := blockHeight
-	if startY+blockHeight > c.pageHeight-c.margin {
-		drawHeight = c.pageHeight - c.margin - startY
-	}
-	c.pdf.RectFromUpperLeftWithStyle(c.margin, startY, c.pageWidth-c.margin*2, drawHeight, "F")
-
-	// Çerçeve çiz
-	c.pdf.SetLineWidth(0.5)
-	c.pdf.SetStrokeColor(c.theme.BorderColor.R, c.theme.BorderColor.G, c.theme.BorderColor.B)
-	c.pdf.RectFromUpperLeftWithStyle(c.margin, startY, c.pageWidth-c.margin*2, drawHeight, "D")
-
-	c.y += 8 // Üst pedding
-
-	c.pdf.SetFont("code", "", c.theme.Code.Size)
-	c.pdf.SetTextColor(c.theme.Code.Color.R, c.theme.Code.Color.G, c.theme.Code.Color.B)
-
-	for _, line := range splitLines {
-		c.checkPageBreakForCodeLine(lineHeight)
-		c.pdf.SetXY(c.margin+8, c.y)
-		// Çok uzun kod satırlarını wrap et
-		c.renderCodeLine(line, c.margin+8)
-		c.y += lineHeight
-	}
-
-	c.y += 8 // Alt pedding
-}
-
-func (c *PDFConverter) checkPageBreakForCodeLine(lineHeight float64) {
-	if c.y+lineHeight > c.pageHeight-c.margin {
-		c.pdf.AddPage()
-		c.drawBackground()
-		c.y = c.margin + 8
-
-		// Yeni sayfada da arka plan çiz (kalan satırlar için)
-		c.pdf.SetFillColor(c.theme.CodeBg.R, c.theme.CodeBg.G, c.theme.CodeBg.B)
-		c.pdf.RectFromUpperLeftWithStyle(c.margin, c.y-8, c.pageWidth-c.margin*2, c.pageHeight-c.margin*2, "F")
-		c.pdf.SetLineWidth(0.5)
-		c.pdf.SetStrokeColor(c.theme.BorderColor.R, c.theme.BorderColor.G, c.theme.BorderColor.B)
-		c.pdf.RectFromUpperLeftWithStyle(c.margin, c.y-8, c.pageWidth-c.margin*2, c.pageHeight-c.margin*2, "D")
-	}
-}
-
-func (c *PDFConverter) renderCodeLine(line string, startX float64) {
-	// GoPDF'te tab karakterlerini boşluğa çevir
-	line = strings.ReplaceAll(line, "\t", "    ")
-	
-	maxWidth := c.pageWidth - c.margin - startX - 8
-	width, _ := c.pdf.MeasureTextWidth(line)
-
-	if width <= maxWidth {
-		c.pdf.Text(line)
-		return
-	}
-
-	// Sığmıyorsa karakter karakter veya kelime kelime bölerek yaz
-	var currentLine string
-	for _, run := range line {
-		testLine := currentLine + string(run)
-		w, _ := c.pdf.MeasureTextWidth(testLine)
-		if w > maxWidth {
-			c.pdf.Text(currentLine)
-			c.y += c.theme.Code.Size * 1.4
-			c.checkPageBreakForCodeLine(c.theme.Code.Size * 1.4)
-			c.pdf.SetXY(startX, c.y)
-			currentLine = string(run)
-		} else {
-			currentLine = testLine
-		}
-	}
-	c.pdf.Text(currentLine)
-}
-
-func (c *PDFConverter) renderThematicBreak(tb *ast.ThematicBreak) {
-	c.checkPageBreak(10)
-	c.y += 6
-	c.pdf.SetLineWidth(1.0)
-	c.pdf.SetStrokeColor(c.theme.BorderColor.R, c.theme.BorderColor.G, c.theme.BorderColor.B)
-	c.pdf.Line(c.margin, c.y, c.pageWidth-c.margin, c.y)
-	c.y += 6
-}
-
-func (c *PDFConverter) collectInlineSpans(node ast.Node, defaultFont string, defaultSize float64, defaultColor color.RGBA) []TextSpan {
-	var spans []TextSpan
-	
-	var walk func(n ast.Node, font string, size float64, col color.RGBA, isLink bool, linkDest string)
-	walk = func(n ast.Node, font string, size float64, col color.RGBA, isLink bool, linkDest string) {
-		for child := n.FirstChild(); child != nil; child = child.NextSibling() {
-			switch child.Kind() {
-			case ast.KindText:
-				t := child.(*ast.Text)
-				content := string(t.Segment.Value(c.source))
-				spans = append(spans, TextSpan{
-					Text:     content,
-					Font:     font,
-					Size:     size,
-					Color:    col,
-					IsLink:   isLink,
-					LinkDest: linkDest,
-				})
-			case ast.KindEmphasis:
-				emp := child.(*ast.Emphasis)
-				fontStyle := "italic"
-				if emp.Level == 2 {
-					fontStyle = "bold"
-				}
-				walk(child, fontStyle, size, col, isLink, linkDest)
-			case ast.KindCodeSpan:
-				// Code span içindeki düz metni topla
-				var codeText string
-				for cc := child.FirstChild(); cc != nil; cc = cc.NextSibling() {
-					if cc.Kind() == ast.KindText {
-						codeText += string(cc.(*ast.Text).Segment.Value(c.source))
-					}
-				}
-				if codeText == "" {
-					// Bazen çocuk düğüm olmayabilir, doğrudan segmentlerden al
-					segments := child.Text(c.source)
-					codeText = string(segments)
-				}
-				spans = append(spans, TextSpan{
-					Text:    codeText,
-					Font:    "code",
-					Size:    size - 1,
-					Color:   c.theme.Code.Color,
-					BgColor: &c.theme.CodeBg,
-				})
-			case ast.KindLink:
-				linkNode := child.(*ast.Link)
-				dest := string(linkNode.Destination)
-				walk(child, font, size, c.theme.LinkColor, true, dest)
-			case ast.KindAutoLink:
-				al := child.(*ast.AutoLink)
-				dest := string(al.Label(c.source))
-				spans = append(spans, TextSpan{
-					Text:     dest,
-					Font:     font,
-					Size:     size,
-					Color:    c.theme.LinkColor,
-					IsLink:   true,
-					LinkDest: dest,
-				})
-			default:
-				if child.HasChildren() {
-					walk(child, font, size, col, isLink, linkDest)
-				}
-			}
-		}
-	}
-
-	walk(node, defaultFont, defaultSize, defaultColor, false, "")
-	return spans
-}
-
-func (c *PDFConverter) renderSpans(spans []TextSpan, startX float64, lineHeightMultiplier float64) {
-	if len(spans) == 0 {
-		return
-	}
-
-	type WordPart struct {
-		Text     string
-		Font     string
-		Size     float64
-		Color    color.RGBA
-		BgColor  *color.RGBA
-		IsLink   bool
-		LinkDest string
-	}
-
-	// Spans listesini kelime ve boşluk parçalarına ayıralım
-	var parts []WordPart
-	for _, span := range spans {
-		// Satır sonu karakterlerini temizle veya boşluğa çevir
-		textVal := strings.ReplaceAll(span.Text, "\n", " ")
+	return re.ReplaceAllStringFunc(html, func(match string) string {
+		submatches := re.FindStringSubmatch(match)
+		alertType := strings.ToUpper(submatches[1])
+		firstPara := submatches[2]
+		remaining := submatches[3]
 		
-		// Kelime kelime bölme
-		// Boşlukları korumak için split yerine karakter gezebiliriz
-		var currentWord strings.Builder
-		for i, run := range textVal {
-			if run == ' ' {
-				if currentWord.Len() > 0 {
-					parts = append(parts, WordPart{
-						Text:     currentWord.String(),
-						Font:     span.Font,
-						Size:     span.Size,
-						Color:    span.Color,
-						BgColor:  span.BgColor,
-						IsLink:   span.IsLink,
-						LinkDest: span.LinkDest,
-					})
-					currentWord.Reset()
-				}
-				parts = append(parts, WordPart{
-					Text:     " ",
-					Font:     span.Font,
-					Size:     span.Size,
-					Color:    span.Color,
-					BgColor:  span.BgColor,
-					IsLink:   span.IsLink,
-					LinkDest: span.LinkDest,
-				})
-			} else {
-				currentWord.WriteRune(run)
-			}
-			if i == len(textVal)-1 && currentWord.Len() > 0 {
-				parts = append(parts, WordPart{
-					Text:     currentWord.String(),
-					Font:     span.Font,
-					Size:     span.Size,
-					Color:    span.Color,
-					BgColor:  span.BgColor,
-					IsLink:   span.IsLink,
-					LinkDest: span.LinkDest,
-				})
-			}
+		var title string
+		switch alertType {
+		case "NOTE": title = "NOT"
+		case "TIP": title = "İPUCU"
+		case "IMPORTANT": title = "ÖNEMLİ"
+		case "WARNING": title = "UYARI"
+		case "CAUTION": title = "DİKKAT"
+		default: title = alertType
 		}
-	}
-
-	// Kelimeleri satırlara yerleştir
-	x := startX
-	lineHeight := spans[0].Size * lineHeightMultiplier
-
-	c.checkPageBreak(lineHeight)
-
-	for _, part := range parts {
-		c.pdf.SetFont(part.Font, "", part.Size)
-		width, _ := c.pdf.MeasureTextWidth(part.Text)
-
-		// Eğer satır sonuna geldiysek ve kelime sığmıyorsa (boşluk hariç)
-		if x+width > c.pageWidth-c.margin && part.Text != " " {
-			c.y += lineHeight
-			c.checkPageBreak(lineHeight)
-			x = startX
-		}
-
-		c.pdf.SetXY(x, c.y)
-		c.pdf.SetTextColor(part.Color.R, part.Color.G, part.Color.B)
-
-		// Arka plan çizimi (örneğin inline code için)
-		if part.BgColor != nil {
-			c.pdf.SetFillColor(part.BgColor.R, part.BgColor.G, part.BgColor.B)
-			// Kelime etrafına küçük bir kutu çiz
-			c.pdf.RectFromUpperLeftWithStyle(x, c.y-1, width, part.Size+2, "F")
-			// Yazı rengini tekrar ayarla (çünkü fill rengi değişti)
-			c.pdf.SetTextColor(part.Color.R, part.Color.G, part.Color.B)
-		}
-
-		if part.IsLink {
-			// Link çiz ve tıklandığında hedefe gitmesini sağla
-			c.pdf.Text(part.Text)
-			// GoPDF link ekleme
-			c.pdf.AddExternalLink(part.LinkDest, x, c.y, width, part.Size)
-			// Altını çiz
-			c.pdf.SetLineWidth(0.5)
-			c.pdf.SetStrokeColor(part.Color.R, part.Color.G, part.Color.B)
-			c.pdf.Line(x, c.y+part.Size, x+width, c.y+part.Size)
-		} else {
-			c.pdf.Text(part.Text)
-		}
-
-		x += width
-	}
-
-	c.y += lineHeight // Paragraf sonu satır kayması
+		
+		classType := strings.ToLower(alertType)
+		fullContent := fmt.Sprintf("<p>%s</p>%s", firstPara, remaining)
+		
+		return fmt.Sprintf(`<div class="markdown-alert markdown-alert-%s"><p class="markdown-alert-title">%s</p>%s</div>`, classType, title, fullContent)
+	})
 }
 
-func (c *PDFConverter) addPageNumbers() {
-	pages := c.pdf.GetNumberOfPages()
-	c.pdf.SetFont("regular", "", 8)
-	c.pdf.SetTextColor(120, 120, 120)
-
-	for i := 1; i <= pages; i++ {
-		c.pdf.SetPage(i)
-		pageStr := fmt.Sprintf("%d / %d", i, pages)
-		w, _ := c.pdf.MeasureTextWidth(pageStr)
-		c.pdf.SetXY((c.pageWidth-w)/2, c.pageHeight-c.margin/2)
-		c.pdf.Text(pageStr)
+func getThemeCSS(themeName string, marginMm string, isLandscape bool) string {
+	pageSize := "A4 portrait"
+	if isLandscape {
+		pageSize = "A4 landscape"
 	}
+
+	commonCSS := fmt.Sprintf(`
+		@page {
+			size: %s;
+			margin: %s;
+			@bottom-right {
+				content: counter(page);
+				font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+				font-size: 8pt;
+				color: #718096;
+			}
+		}
+		@page :first {
+			@bottom-right {
+				content: normal; /* Kapak sayfasında sayfa numarasını gizle */
+			}
+		}
+		body {
+			line-height: 1.6;
+			word-wrap: break-word;
+			margin: 0;
+			padding: 0;
+		}
+		
+		/* Kapak Sayfasi Tasarimi */
+		.cover-page {
+			height: 85vh;
+			display: flex;
+			flex-direction: column;
+			justify-content: space-between;
+			page-break-after: always;
+			box-sizing: border-box;
+			padding: 60px 0;
+		}
+		.cover-center {
+			margin-top: auto;
+			margin-bottom: auto;
+			text-align: center;
+		}
+		.cover-title {
+			font-family: "Inter", system-ui, -apple-system, sans-serif;
+			font-size: 28pt;
+			font-weight: 800;
+			color: #0f172a;
+			line-height: 1.25;
+			margin-bottom: 20px;
+		}
+		.cover-divider {
+			width: 80px;
+			height: 4px;
+			background-color: #6366f1;
+			margin: 24px auto;
+			border-radius: 2px;
+		}
+		.cover-subtitle {
+			font-size: 13pt;
+			color: #475569;
+			max-width: 550px;
+			margin: 0 auto;
+			line-height: 1.5;
+		}
+		.cover-footer {
+			margin-top: auto;
+			text-align: right;
+			border-top: 1px solid #e2e8f0;
+			padding-top: 20px;
+		}
+		.cover-date {
+			font-size: 10pt;
+			color: #64748b;
+			font-weight: 500;
+		}
+		.content-page {
+			page-break-before: always;
+		}
+		
+		/* GFM Tablo Tasarımı */
+		table {
+			border-spacing: 0;
+			border-collapse: collapse;
+			width: 100%%;
+			margin-top: 12px;
+			margin-bottom: 20px;
+			page-break-inside: avoid;
+		}
+		table th, table td {
+			padding: 10px 14px;
+			border: 1px solid #e2e8f0;
+			text-align: left;
+		}
+		table tr {
+			background-color: #ffffff;
+		}
+		
+		/* Kod Blokları */
+		pre {
+			padding: 16px;
+			overflow: auto;
+			font-size: 85%%;
+			line-height: 1.45;
+			background-color: #f6f8fa;
+			border-radius: 6px;
+			border: 1px solid #d0d7de;
+			word-wrap: normal;
+		}
+		code {
+			font-family: ui-monospace, SFMono-Regular, SF Mono, Menlo, Consolas, Liberation Mono, monospace;
+			font-size: 85%%;
+			margin: 0;
+			padding: .2em .4em;
+			background-color: rgba(175,184,193,0.2);
+			border-radius: 6px;
+		}
+		pre code {
+			background-color: transparent;
+			padding: 0;
+			font-size: 100%%;
+			word-break: normal;
+		}
+		
+		/* Blockquotes */
+		blockquote {
+			padding: 0 1em;
+			color: #475569;
+			border-left: .25em solid #cbd5e1;
+			margin: 0 0 20px 0;
+		}
+		blockquote p {
+			margin-top: 0;
+			margin-bottom: 8px;
+		}
+		blockquote p:last-child {
+			margin-bottom: 0;
+		}
+		
+		/* Alert Kutuları */
+		.markdown-alert {
+			padding: 12px 16px;
+			margin-bottom: 20px;
+			border-left: .25em solid #cbd5e1;
+			border-radius: 0 6px 6px 0;
+			background-color: #f8fafc;
+			page-break-inside: avoid;
+		}
+		.markdown-alert-title {
+			display: flex;
+			align-items: center;
+			font-weight: 600;
+			font-size: 14px;
+			margin-top: 0;
+			margin-bottom: 6px;
+		}
+		.markdown-alert-note {
+			border-left-color: #0969da;
+			background-color: #f0f7ff;
+		}
+		.markdown-alert-note .markdown-alert-title {
+			color: #0969da;
+		}
+		.markdown-alert-important {
+			border-left-color: #8250df;
+			background-color: #fbefff;
+		}
+		.markdown-alert-important .markdown-alert-title {
+			color: #8250df;
+		}
+		.markdown-alert-warning {
+			border-left-color: #9a6700;
+			background-color: #fff8ec;
+		}
+		.markdown-alert-warning .markdown-alert-title {
+			color: #9a6700;
+		}
+		.markdown-alert-caution {
+			border-left-color: #cf222e;
+			background-color: #fff0f0;
+		}
+		.markdown-alert-caution .markdown-alert-title {
+			color: #cf222e;
+		}
+		.markdown-alert-tip {
+			border-left-color: #1a7f37;
+			background-color: #f0fdf4;
+		}
+		.markdown-alert-tip .markdown-alert-title {
+			color: #1a7f37;
+		}
+		
+		/* Dipnotlar */
+		.footnotes {
+			margin-top: 40px;
+			padding-top: 20px;
+			border-top: 1px solid #cbd5e1;
+			font-size: 9pt;
+			color: #475569;
+		}
+		.footnotes ol {
+			padding-left: 20px;
+		}
+		.footnotes li {
+			margin-bottom: 8px;
+		}
+		.footnotes li p {
+			margin-bottom: 0;
+			display: inline;
+		}
+	`, pageSize, marginMm)
+
+	specificCSS := `
+		body {
+			font-family: "Inter", system-ui, -apple-system, sans-serif;
+			color: #1e293b; /* Slate 800 */
+			font-size: 10.5pt;
+			line-height: 1.6;
+		}
+		h1, h2, h3, h4, h5, h6 {
+			color: #0f172a; /* Slate 900 */
+			font-weight: 700;
+			margin-top: 28px;
+			margin-bottom: 14px;
+		}
+		h1 {
+			font-size: 24pt;
+			border-bottom: 2px solid #6366f1; /* Indigo 500 */
+			padding-bottom: 10px;
+			color: #4f46e5; /* Indigo 600 */
+		}
+		h2 {
+			font-size: 16pt;
+			border-bottom: 1px solid #e2e8f0;
+			padding-bottom: 6px;
+		}
+		h3 {
+			font-size: 13pt;
+		}
+		p {
+			margin-top: 0;
+			margin-bottom: 16px;
+			text-align: justify;
+		}
+		table {
+			border-radius: 8px;
+			overflow: hidden;
+			border: 1px solid #e2e8f0;
+			box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05);
+		}
+		table th {
+			background-color: #f8fafc; /* Slate 50 */
+			color: #0f172a;
+			font-weight: 600;
+			border-bottom: 2px solid #e2e8f0;
+		}
+		table td {
+			border-bottom: 1px solid #f1f5f9;
+		}
+		table tr:nth-child(even) {
+			background-color: #f8fafc;
+		}
+		blockquote {
+			border-left: 4px solid #6366f1; /* Indigo 500 */
+			background-color: #f8fafc; /* Slate 50 */
+			padding: 12px 16px;
+			border-radius: 0 8px 8px 0;
+		}
+	`
+
+	return commonCSS + specificCSS
 }
 
 func ConvertMarkdownToPDF(sourcePath string, destPath string, themeName string, margin float64, isLandscape bool) error {
@@ -565,7 +449,7 @@ func ConvertMarkdownToPDF(sourcePath string, destPath string, themeName string, 
 
 	theme, exists := Themes[strings.ToLower(themeName)]
 	if !exists {
-		theme = Themes["github"] // Varsayılan tema
+		theme = Themes["modern"] // Varsayılan tema
 	}
 
 	converter := NewPDFConverter(theme, margin, source)
@@ -578,7 +462,6 @@ func ConvertMultipleMarkdownToPDF(srcDir string, destDir string, themeName strin
 		return fmt.Errorf("kaynak dizin okunamadı: %v", err)
 	}
 
-	// Hedef dizini oluştur
 	if destDir != "" {
 		err = os.MkdirAll(destDir, 0755)
 		if err != nil {
@@ -588,15 +471,14 @@ func ConvertMultipleMarkdownToPDF(srcDir string, destDir string, themeName strin
 
 	for _, entry := range entries {
 		if !entry.IsDir() && strings.HasSuffix(strings.ToLower(entry.Name()), ".md") {
-			srcPath := srcDir + "/" + entry.Name()
+			srcPath := filepath.Join(srcDir, entry.Name())
 			pdfName := strings.TrimSuffix(entry.Name(), ".md") + ".pdf"
 			
-			destPath := pdfName
+			var destPath string
 			if destDir != "" {
-				destPath = destDir + "/" + pdfName
+				destPath = filepath.Join(destDir, pdfName)
 			} else {
-				// Aynı dizine kaydet
-				destPath = srcDir + "/" + pdfName
+				destPath = filepath.Join(srcDir, pdfName)
 			}
 
 			fmt.Printf("Dönüştürülüyor: %s -> %s\n", srcPath, destPath)
@@ -608,3 +490,55 @@ func ConvertMultipleMarkdownToPDF(srcDir string, destDir string, themeName strin
 	}
 	return nil
 }
+
+func extractCoverPage(html string) (string, string) {
+	h1Re := regexp.MustCompile(`(?is)<h1[^>]*>(.*?)</h1>`)
+	h1Match := h1Re.FindStringSubmatch(html)
+	if len(h1Match) == 0 {
+		return "", html
+	}
+	
+	title := h1Match[1]
+	h1Loc := h1Re.FindStringIndex(html)
+	afterH1 := html[h1Loc[1]:]
+	
+	pRe := regexp.MustCompile(`(?is)^\s*<p[^>]*>(.*?)</p>`)
+	pMatch := pRe.FindStringSubmatch(afterH1)
+	
+	subtitle := ""
+	remainingHTML := afterH1
+	if len(pMatch) > 0 {
+		subtitle = pMatch[1]
+		pLoc := pRe.FindStringIndex(afterH1)
+		remainingHTML = afterH1[pLoc[1]:]
+	}
+	
+	hrRe := regexp.MustCompile(`^\s*<hr[^>]*>`)
+	if hrRe.MatchString(remainingHTML) {
+		loc := hrRe.FindStringIndex(remainingHTML)
+		remainingHTML = remainingHTML[loc[1]:]
+	}
+	
+	coverHTML := fmt.Sprintf(`
+	<div class="cover-page">
+		<div class="cover-center">
+			<h1 class="cover-title">%s</h1>
+			<div class="cover-divider"></div>
+			%s
+		</div>
+		<div class="cover-footer">
+			<span class="cover-date">%s</span>
+		</div>
+	</div>
+	`, title, formatSubtitle(subtitle), time.Now().Format("02.01.2006"))
+	
+	return coverHTML, remainingHTML
+}
+
+func formatSubtitle(sub string) string {
+	if sub == "" {
+		return ""
+	}
+	return fmt.Sprintf(`<p class="cover-subtitle">%s</p>`, sub)
+}
+
