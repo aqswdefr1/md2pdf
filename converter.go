@@ -21,13 +21,15 @@ type PDFConverter struct {
 	theme  Theme
 	margin float64
 	source []byte
+	cover  bool
 }
 
-func NewPDFConverter(theme Theme, margin float64, source []byte) *PDFConverter {
+func NewPDFConverter(theme Theme, margin float64, source []byte, cover bool) *PDFConverter {
 	return &PDFConverter{
 		theme:  theme,
 		margin: margin,
 		source: source,
+		cover:  cover,
 	}
 }
 
@@ -43,6 +45,7 @@ func (c *PDFConverter) Convert(markdownPath string, pdfPath string, isLandscape 
 		),
 		goldmark.WithRendererOptions(
 			html.WithUnsafe(),
+			html.WithHardWraps(),
 		),
 	)
 	var htmlBuf strings.Builder
@@ -56,15 +59,23 @@ func (c *PDFConverter) Convert(markdownPath string, pdfPath string, isLandscape 
 	htmlContent = convertAlertsToHTML(htmlContent)
 
 	// 3. Kapak sayfasını ayrıştır
-	coverHTML, remainingHTML := extractCoverPage(htmlContent)
+	var coverHTML, remainingHTML string
+	if c.cover {
+		coverHTML, remainingHTML = extractCoverPage(htmlContent)
+	} else {
+		coverHTML = ""
+		remainingHTML = htmlContent
+	}
 
 	// 4. CSS ve Şablon ekle
-	marginMm := fmt.Sprintf("%dmm", int(c.margin * 0.352778)) // point'ten mm'ye dönüşüm
-	if c.margin == 50.0 {
-		marginMm = "20mm" // Varsayılan değer
+	marginMm := ""
+	if c.margin < 0 {
+		marginMm = "20mm 15mm" // Otomatik mod: Üst/alt 20mm, sol/sağ 15mm dengeli boşluk
+	} else {
+		marginMm = fmt.Sprintf("%dmm", int(c.margin * 0.352778)) // point'ten mm'ye dönüşüm
 	}
 	
-	themeCSS := getThemeCSS(c.theme.Name, marginMm, isLandscape)
+	themeCSS := getThemeCSS(c.theme.Name, marginMm, isLandscape, c.cover)
 	
 	fullHTML := fmt.Sprintf(`<!DOCTYPE html>
 <html>
@@ -167,10 +178,26 @@ func convertAlertsToHTML(html string) string {
 	})
 }
 
-func getThemeCSS(themeName string, marginMm string, isLandscape bool) string {
+func getThemeCSS(themeName string, marginMm string, isLandscape bool, hasCover bool) string {
 	pageSize := "A4 portrait"
 	if isLandscape {
 		pageSize = "A4 landscape"
+	}
+
+	firstPageCSS := ""
+	if hasCover {
+		firstPageCSS = `
+		@page :first {
+			@bottom-right {
+				content: normal; /* Kapak sayfasında sayfa numarasını gizle */
+			}
+		}
+		`
+	}
+
+	contentPageBreak := "auto"
+	if hasCover {
+		contentPageBreak = "always"
 	}
 
 	commonCSS := fmt.Sprintf(`
@@ -178,17 +205,13 @@ func getThemeCSS(themeName string, marginMm string, isLandscape bool) string {
 			size: %s;
 			margin: %s;
 			@bottom-right {
-				content: counter(page);
+				content: counter(page) "/" counter(pages);
 				font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 				font-size: 8pt;
 				color: #718096;
 			}
 		}
-		@page :first {
-			@bottom-right {
-				content: normal; /* Kapak sayfasında sayfa numarasını gizle */
-			}
-		}
+		%s
 		body {
 			line-height: 1.6;
 			word-wrap: break-word;
@@ -245,7 +268,7 @@ func getThemeCSS(themeName string, marginMm string, isLandscape bool) string {
 			font-weight: 500;
 		}
 		.content-page {
-			page-break-before: always;
+			page-break-before: %s;
 		}
 		
 		/* GFM Tablo Tasarımı */
@@ -378,7 +401,7 @@ func getThemeCSS(themeName string, marginMm string, isLandscape bool) string {
 			margin-bottom: 0;
 			display: inline;
 		}
-	`, pageSize, marginMm)
+	`, pageSize, marginMm, firstPageCSS, contentPageBreak)
 
 	specificCSS := `
 		body {
@@ -392,12 +415,15 @@ func getThemeCSS(themeName string, marginMm string, isLandscape bool) string {
 			font-weight: 700;
 			margin-top: 28px;
 			margin-bottom: 14px;
+			page-break-after: avoid;
+			break-after: avoid;
 		}
 		h1 {
 			font-size: 24pt;
 			border-bottom: 2px solid #6366f1; /* Indigo 500 */
 			padding-bottom: 10px;
 			color: #4f46e5; /* Indigo 600 */
+			text-align: center;
 		}
 		h2 {
 			font-size: 16pt;
@@ -441,7 +467,7 @@ func getThemeCSS(themeName string, marginMm string, isLandscape bool) string {
 	return commonCSS + specificCSS
 }
 
-func ConvertMarkdownToPDF(sourcePath string, destPath string, themeName string, margin float64, isLandscape bool) error {
+func ConvertMarkdownToPDF(sourcePath string, destPath string, themeName string, margin float64, isLandscape bool, cover bool) error {
 	source, err := os.ReadFile(sourcePath)
 	if err != nil {
 		return fmt.Errorf("kaynak dosya okunamadı: %v", err)
@@ -452,11 +478,11 @@ func ConvertMarkdownToPDF(sourcePath string, destPath string, themeName string, 
 		theme = Themes["modern"] // Varsayılan tema
 	}
 
-	converter := NewPDFConverter(theme, margin, source)
+	converter := NewPDFConverter(theme, margin, source, cover)
 	return converter.Convert(sourcePath, destPath, isLandscape)
 }
 
-func ConvertMultipleMarkdownToPDF(srcDir string, destDir string, themeName string, margin float64) error {
+func ConvertMultipleMarkdownToPDF(srcDir string, destDir string, themeName string, margin float64, cover bool) error {
 	entries, err := os.ReadDir(srcDir)
 	if err != nil {
 		return fmt.Errorf("kaynak dizin okunamadı: %v", err)
@@ -482,7 +508,7 @@ func ConvertMultipleMarkdownToPDF(srcDir string, destDir string, themeName strin
 			}
 
 			fmt.Printf("Dönüştürülüyor: %s -> %s\n", srcPath, destPath)
-			err = ConvertMarkdownToPDF(srcPath, destPath, themeName, margin, false)
+			err = ConvertMarkdownToPDF(srcPath, destPath, themeName, margin, false, cover)
 			if err != nil {
 				fmt.Printf("Hata: %s dönüştürülemedi: %v\n", srcPath, err)
 			}

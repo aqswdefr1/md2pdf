@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"os"
@@ -9,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/AlecAivazis/survey/v2"
 	"github.com/fsnotify/fsnotify"
 )
 
@@ -17,11 +17,12 @@ func main() {
 	input := flag.String("input", "", "Giriş markdown dosyası (.md) veya dizini")
 	output := flag.String("output", "", "Çıkış PDF dosyası (.pdf) veya dizini")
 	theme := flag.String("theme", "modern", "Tema seçimi (sadece modern mevcuttur)")
-	margin := flag.Float64("margin", 50.0, "Kenar boşluğu (point birimiyle)")
+	margin := flag.Float64("margin", -1.0, "Kenar boşluğu (point birimiyle, varsayılan: otomatik)")
 	watch := flag.Bool("watch", false, "Canlı izleme modu (dosya değiştikçe PDF güncellenir)")
 	landscape := flag.Bool("landscape", false, "Yatay sayfa yönlendirmesi")
 	interactive := flag.Bool("interactive", false, "İnteraktif CLI modu")
 	flag.BoolVar(interactive, "i", false, "İnteraktif CLI modu (kısayol)")
+	cover := flag.Bool("cover", true, "Kapak sayfası oluşturulsun mu?")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Kullanım: md2pdf [seçenekler]\n\nSeçenekler:\n")
@@ -57,7 +58,7 @@ func main() {
 			fmt.Println("Hata: Dizin izleme (watch modu) şimdilik sadece tek dosya için desteklenmektedir.")
 			os.Exit(1)
 		}
-		runBatchConversion(*input, *output, *theme, *margin)
+		runBatchConversion(*input, *output, *theme, *margin, *cover)
 	} else {
 		// Tek dosya dönüştürme
 		destPath := *output
@@ -66,37 +67,37 @@ func main() {
 			destPath = strings.TrimSuffix(*input, filepath.Ext(*input)) + ".pdf"
 		}
 
-		runSingleConversion(*input, destPath, *theme, *margin, *landscape)
+		runSingleConversion(*input, destPath, *theme, *margin, *landscape, *cover)
 
 		if *watch {
-			runWatcher(*input, destPath, *theme, *margin, *landscape)
+			runWatcher(*input, destPath, *theme, *margin, *landscape, *cover)
 		}
 	}
 }
 
-func runSingleConversion(src, dest, theme string, margin float64, landscape bool) {
-	fmt.Printf("[%s] Dönüştürülüyor: %s -> %s\n", time.Now().Format("15:04:05"), src, dest)
+func runSingleConversion(src, dest, theme string, margin float64, landscape bool, cover bool) {
+	fmt.Printf("\n⚡ [%s] Dönüştürülüyor:\n   ➔ Giriş: %s\n   ➔ Çıkış: %s\n", time.Now().Format("15:04:05"), src, dest)
 	start := time.Now()
-	err := ConvertMarkdownToPDF(src, dest, theme, margin, landscape)
+	err := ConvertMarkdownToPDF(src, dest, theme, margin, landscape, cover)
 	if err != nil {
-		fmt.Printf("Dönüştürme hatası: %v\n", err)
+		fmt.Printf(" ❌ Dönüştürme hatası: %v\n", err)
 		return
 	}
-	fmt.Printf("Başarıyla tamamlandı! Süre: %v\n", time.Since(start))
+	fmt.Printf(" ✔  Başarıyla tamamlandı! (Süre: %v)\n", time.Since(start).Round(time.Millisecond))
 }
 
-func runBatchConversion(srcDir, destDir, theme string, margin float64) {
-	fmt.Printf("Toplu dönüştürme başlatıldı: %s\n", srcDir)
+func runBatchConversion(srcDir, destDir, theme string, margin float64, cover bool) {
+	fmt.Printf("\n⚡ Toplu dönüştürme başlatıldı: %s\n", srcDir)
 	start := time.Now()
-	err := ConvertMultipleMarkdownToPDF(srcDir, destDir, theme, margin)
+	err := ConvertMultipleMarkdownToPDF(srcDir, destDir, theme, margin, cover)
 	if err != nil {
-		fmt.Printf("Toplu dönüştürme hatası: %v\n", err)
+		fmt.Printf(" ❌ Toplu dönüştürme hatası: %v\n", err)
 		return
 	}
-	fmt.Printf("Toplu dönüştürme tamamlandı! Toplam süre: %v\n", time.Since(start))
+	fmt.Printf(" ✔  Toplu dönüştürme tamamlandı! (Toplam süre: %v)\n", time.Since(start).Round(time.Millisecond))
 }
 
-func runWatcher(src, dest, theme string, margin float64, landscape bool) {
+func runWatcher(src, dest, theme string, margin float64, landscape bool, cover bool) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		fmt.Printf("Watcher oluşturulamadı: %v\n", err)
@@ -128,7 +129,7 @@ func runWatcher(src, dest, theme string, margin float64, landscape bool) {
 				if time.Since(lastEventTime) > 500*time.Millisecond {
 					lastEventTime = time.Now()
 					fmt.Printf("\n[%s] Değişiklik algılandı, PDF güncelleniyor...\n", time.Now().Format("15:04:05"))
-					runSingleConversion(src, dest, theme, margin, landscape)
+					runSingleConversion(src, dest, theme, margin, landscape, cover)
 				}
 			}
 		case err, ok := <-watcher.Errors:
@@ -141,103 +142,99 @@ func runWatcher(src, dest, theme string, margin float64, landscape bool) {
 }
 
 func runInteractiveMode() {
-	fmt.Println("=========================================")
-	fmt.Println("    md2pdf İnteraktif Sihirbazı          ")
-	fmt.Println("=========================================")
-	fmt.Println("İpucu: Dosyanızı bu terminal penceresine sürükleyip bırakabilirsiniz.")
+	fmt.Println("┌────────────────────────────────────────────────────────┐")
+	fmt.Println("│             📄 md2pdf İnteraktif Sihirbazı             │")
+	fmt.Println("└────────────────────────────────────────────────────────┘")
+	fmt.Println(" ℹ  İpucu: Dosyanızı bu terminal penceresine sürükleyip bırakabilirsiniz.")
 	fmt.Println()
 
-	var inputPath string
-	inputPrompt := &survey.Input{
-		Message: "Giriş Markdown dosyası veya klasörünün yolu:",
-	}
-	err := survey.AskOne(inputPrompt, &inputPath, survey.WithValidator(survey.Required))
-	if err != nil {
-		fmt.Println("İşlem iptal edildi:", err)
-		return
-	}
+	reader := bufio.NewReader(os.Stdin)
 
-	// Sürükle-bırak tırnaklarını temizle
-	inputPath = strings.Trim(inputPath, "\"'` ")
+	// 1. Giriş Yolu
+	var inputPath string
+	for {
+		fmt.Print(" ➔  Giriş Markdown dosyası veya klasörünün yolu:\n    » ")
+		input, _ := reader.ReadString('\n')
+		inputPath = strings.TrimSpace(input)
+		inputPath = strings.Trim(inputPath, "\"'` ") // Sürükle-bırak tırnaklarını temizle
+		if inputPath != "" {
+			break
+		}
+		fmt.Println(" ❌ Hata: Giriş yolu boş olamaz.\n")
+	}
 
 	// Giriş dosyasının/klasörünün varlığını kontrol et
 	fileInfo, err := os.Stat(inputPath)
 	if err != nil {
-		fmt.Printf("Hata: Belirtilen yol bulunamadı: %v\n", err)
+		fmt.Printf(" ❌ Hata: Belirtilen yol bulunamadı: %v\n", err)
 		return
 	}
 	isDir := fileInfo.IsDir()
 
-	// Çıkış yolu sorusu
-	var outputPath string
-	outputPrompt := &survey.Input{
-		Message: "Çıkış PDF dosyasının/klasörünün yolu (Varsayılan için boş bırakın):",
-	}
-	err = survey.AskOne(outputPrompt, &outputPath)
-	if err != nil {
-		fmt.Println("İşlem iptal edildi:", err)
-		return
-	}
+	// 2. Çıkış Yolu
+	fmt.Print(" ➔  Çıkış PDF yolu (Varsayılan için Enter'a basın):\n    » ")
+	outputPath, _ := reader.ReadString('\n')
+	outputPath = strings.TrimSpace(outputPath)
 	outputPath = strings.Trim(outputPath, "\"'` ")
 
 	theme := "modern"
 
-	// Kenar boşluğu (Margin)
-	var marginStr string
-	marginPrompt := &survey.Input{
-		Message: "Kenar boşluğu değeri (point):",
-		Default: "50",
-	}
-	err = survey.AskOne(marginPrompt, &marginStr)
-	if err != nil {
-		fmt.Println("İşlem iptal edildi:", err)
-		return
-	}
-	margin, err := strconv.ParseFloat(marginStr, 64)
-	if err != nil {
-		fmt.Println("Geçersiz değer girildi, varsayılan (50.0) kullanılacak.")
-		margin = 50.0
+	// 3. Kenar Boşluğu
+	fmt.Print(" ➔  Kenar boşluğu değeri (Point birimiyle, Otomatik için Enter):\n    » ")
+	marginStr, _ := reader.ReadString('\n')
+	marginStr = strings.TrimSpace(marginStr)
+	margin := -1.0
+	if marginStr != "" {
+		m, err := strconv.ParseFloat(marginStr, 64)
+		if err == nil {
+			margin = m
+		} else {
+			fmt.Println(" ⚠️  Geçersiz değer girildi, otomatik kullanılacak.")
+		}
 	}
 
-	// Yönlendirme (Dikey / Yatay)
-	var orientation string
-	orientationPrompt := &survey.Select{
-		Message: "Sayfa yönlendirmesi:",
-		Options: []string{"Dikey (Portrait)", "Yatay (Landscape)"},
-		Default: "Dikey (Portrait)",
+	// 4. Sayfa Yönlendirmesi
+	fmt.Print(" ➔  Sayfa yönlendirmesi [1: Dikey (Portrait), 2: Yatay (Landscape)] (Varsayılan: 1):\n    » ")
+	orientationStr, _ := reader.ReadString('\n')
+	orientationStr = strings.TrimSpace(orientationStr)
+	landscape := false
+	if orientationStr == "2" {
+		landscape = true
 	}
-	err = survey.AskOne(orientationPrompt, &orientation)
-	if err != nil {
-		fmt.Println("İşlem iptal edildi:", err)
-		return
-	}
-	landscape := (orientation == "Yatay (Landscape)")
 
-	// Watch modu (Sadece dosya ise)
-	var watch bool
+	// 5. Kapak Sayfası
+	fmt.Print(" ➔  Kapak sayfası oluşturulsun mu? [E/h] (Varsayılan: E):\n    » ")
+	coverStr, _ := reader.ReadString('\n')
+	coverStr = strings.TrimSpace(strings.ToLower(coverStr))
+	cover := true
+	if coverStr == "h" || coverStr == "hayır" || coverStr == "n" || coverStr == "no" {
+		cover = false
+	}
+
+	// 6. Watch modu (Sadece dosya ise)
+	watch := false
 	if !isDir {
-		watchPrompt := &survey.Confirm{
-			Message: "Dosya değişikliklerini canlı izlemek ister misiniz? (Watch Mode)",
-			Default: false,
-		}
-		err = survey.AskOne(watchPrompt, &watch)
-		if err != nil {
-			fmt.Println("İşlem iptal edildi:", err)
-			return
+		fmt.Print(" ➔  Değişiklikleri canlı izlemek ister misiniz? (Watch Mode) [e/H] (Varsayılan: H):\n    » ")
+		watchStr, _ := reader.ReadString('\n')
+		watchStr = strings.TrimSpace(strings.ToLower(watchStr))
+		if watchStr == "e" || watchStr == "evet" || watchStr == "y" || watchStr == "yes" {
+			watch = true
 		}
 	}
+
+	fmt.Println("\n⏳ İşlem başlatılıyor...")
 
 	// Çalıştırma aşaması
 	if isDir {
-		runBatchConversion(inputPath, outputPath, theme, margin)
+		runBatchConversion(inputPath, outputPath, theme, margin, cover)
 	} else {
 		destPath := outputPath
 		if destPath == "" {
 			destPath = strings.TrimSuffix(inputPath, filepath.Ext(inputPath)) + ".pdf"
 		}
-		runSingleConversion(inputPath, destPath, theme, margin, landscape)
+		runSingleConversion(inputPath, destPath, theme, margin, landscape, cover)
 		if watch {
-			runWatcher(inputPath, destPath, theme, margin, landscape)
+			runWatcher(inputPath, destPath, theme, margin, landscape, cover)
 		}
 	}
 }
