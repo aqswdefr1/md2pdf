@@ -5,7 +5,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -23,6 +25,8 @@ func main() {
 	interactive := flag.Bool("interactive", false, "İnteraktif CLI modu")
 	flag.BoolVar(interactive, "i", false, "İnteraktif CLI modu (kısayol)")
 	cover := flag.Bool("cover", true, "Kapak sayfası oluşturulsun mu?")
+	openPDF := flag.Bool("open", true, "Oluşturulan PDF dosyasını otomatik aç")
+	flag.BoolVar(openPDF, "o", true, "Oluşturulan PDF dosyasını otomatik aç (kısayol)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Kullanım: md2pdf [seçenekler]\n\nSeçenekler:\n")
@@ -68,6 +72,12 @@ func main() {
 		}
 
 		runSingleConversion(*input, destPath, *theme, *margin, *landscape, *cover)
+
+		if *openPDF {
+			if err := openFile(destPath); err != nil {
+				fmt.Printf(" ⚠️  PDF dosyası otomatik açılamadı: %v\n", err)
+			}
+		}
 
 		if *watch {
 			runWatcher(*input, destPath, *theme, *margin, *landscape, *cover)
@@ -222,8 +232,6 @@ func runInteractiveMode() {
 		}
 	}
 
-	fmt.Println("\n⏳ İşlem başlatılıyor...")
-
 	// Çalıştırma aşaması
 	if isDir {
 		runBatchConversion(inputPath, outputPath, theme, margin, cover)
@@ -233,9 +241,27 @@ func runInteractiveMode() {
 			destPath = strings.TrimSuffix(inputPath, filepath.Ext(inputPath)) + ".pdf"
 		}
 		runSingleConversion(inputPath, destPath, theme, margin, landscape, cover)
+		if err := openFile(destPath); err != nil {
+			fmt.Printf(" ⚠️  PDF dosyası otomatik açılamadı: %v\n", err)
+		}
 		if watch {
 			runWatcher(inputPath, destPath, theme, margin, landscape, cover)
 		}
 	}
+}
+
+func openFile(path string) error {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("cmd", "/c", "start", "", path)
+	case "darwin":
+		cmd = exec.Command("open", path)
+	case "linux":
+		cmd = exec.Command("xdg-open", path)
+	default:
+		return fmt.Errorf("desteklenmeyen isletim sistemi: %s", runtime.GOOS)
+	}
+	return cmd.Start()
 }
 

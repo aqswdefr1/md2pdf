@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	stdhtml "html"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -58,6 +59,9 @@ func (c *PDFConverter) Convert(markdownPath string, pdfPath string, isLandscape 
 	// 2. Alert kutularını HTML içinde düzenle
 	htmlContent = convertAlertsToHTML(htmlContent)
 
+	// 2.1. Mermaid kod bloklarını HTML div'e dönüştür
+	htmlContent = convertMermaidToHTML(htmlContent)
+
 	// 3. Kapak sayfasını ayrıştır
 	var coverHTML, remainingHTML string
 	if c.cover {
@@ -84,6 +88,14 @@ func (c *PDFConverter) Convert(markdownPath string, pdfPath string, isLandscape 
 	<style>
 		%s
 	</style>
+	<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+	<script>
+		mermaid.initialize({
+			startOnLoad: true,
+			theme: 'default',
+			securityLevel: 'loose'
+		});
+	</script>
 </head>
 <body>
 	<div class="markdown-body">
@@ -122,6 +134,28 @@ func (c *PDFConverter) Convert(markdownPath string, pdfPath string, isLandscape 
 	err = chromedp.Run(ctx,
 		chromedp.Navigate(url),
 		chromedp.WaitReady("body"),
+		chromedp.Evaluate(`
+			new Promise((resolve) => {
+				if (typeof mermaid === 'undefined') {
+					resolve();
+					return;
+				}
+				const check = () => {
+					const elements = document.querySelectorAll('.mermaid');
+					if (elements.length === 0) {
+						resolve();
+						return;
+					}
+					const allProcessed = Array.from(elements).every(el => el.getAttribute('data-processed') === 'true');
+					if (allProcessed) {
+						resolve();
+					} else {
+						setTimeout(check, 50);
+					}
+				};
+				check();
+			})
+		`, nil),
 		chromedp.ActionFunc(func(ctx context.Context) error {
 			buf, _, err := page.PrintToPDF().
 				WithMarginTop(0).
@@ -462,6 +496,18 @@ func getThemeCSS(themeName string, marginMm string, isLandscape bool, hasCover b
 			padding: 12px 16px;
 			border-radius: 0 8px 8px 0;
 		}
+		.mermaid {
+			display: flex;
+			justify-content: center;
+			margin: 20px 0;
+			page-break-inside: avoid;
+		}
+		.mermaid svg {
+			width: auto !important;
+			height: auto !important;
+			max-width: 100% !important;
+			max-height: 480px !important;
+		}
 	`
 
 	return commonCSS + specificCSS
@@ -566,5 +612,21 @@ func formatSubtitle(sub string) string {
 		return ""
 	}
 	return fmt.Sprintf(`<p class="cover-subtitle">%s</p>`, sub)
+}
+
+func convertMermaidToHTML(htmlContent string) string {
+	// <pre><code class="language-mermaid"> veya sadece class="language-mermaid" içeren blokları bul
+	re := regexp.MustCompile(`(?is)<pre><code\s+class="(?:chroma\s+)?language-mermaid">(.*?)</code></pre>`)
+	return re.ReplaceAllStringFunc(htmlContent, func(match string) string {
+		submatches := re.FindStringSubmatch(match)
+		if len(submatches) < 2 {
+			return match
+		}
+		content := submatches[1]
+		// HTML karakterlerini geri çevir (örn: &gt; -> >, &lt; -> <)
+		// Mermaid parser ham metin bekler.
+		unescapedContent := stdhtml.UnescapeString(content)
+		return fmt.Sprintf(`<div class="mermaid">%s</div>`, unescapedContent)
+	})
 }
 
